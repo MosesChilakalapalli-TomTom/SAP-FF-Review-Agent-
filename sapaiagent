@@ -1,0 +1,510 @@
+import os
+import json
+import re
+import requests
+import urllib3
+from dotenv import load_dotenv
+from requests.auth import HTTPBasicAuth
+from openai import AzureOpenAI
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+load_dotenv()
+
+SAP_HOST = os.getenv("SAP_HOST", "").strip().rstrip("/")
+SAP_CLIENT = os.getenv("SAP_CLIENT", "").strip()
+SAP_USER = os.getenv("SAP_USER", "").strip()
+SAP_PASS = os.getenv("SAP_PASS", "").strip()
+
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+
+if not all([
+    SAP_HOST, SAP_CLIENT, SAP_USER, SAP_PASS,
+    AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY,
+    AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION
+]):
+    raise Exception("Missing values in .env file")
+
+azure_client = AzureOpenAI(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION
+)
+
+session = requests.Session()
+session.auth = HTTPBasicAuth(SAP_USER, SAP_PASS)
+session.verify = False
+session.headers.update({"Accept": "application/json"})
+
+IDOC_URL = f"{SAP_HOST}/sap/opu/odata/sap/ZIDOC_MONITOR_SRV/FailedIdocSet"
+COST_CENTER_URL = f"{SAP_HOST}/sap/opu/odata/sap/API_COSTCENTER_SRV/A_CostCenterText"
+SO_URL = f"{SAP_HOST}/sap/opu/odata/sap/API_SALES_ORDER_SRV/A_SalesOrder"
+PO_URL = f"{SAP_HOST}/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder"
+BP_URL = f"{SAP_HOST}/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartner"
+OUTBOUND_DELIVERY_URL = f"{SAP_HOST}/sap/opu/odata/sap/API_OUTBOUND_DELIVERY_SRV/A_OutbDeliveryHeader"
+
+
+def clean_value(value):
+    if value is None:
+        return ""
+    value = str(value).strip()
+    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[^A-Za-z0-9._-]", "", value)
+    return value
+
+
+def call_sap(url, params=None):
+    query = {
+        "sap-client": SAP_CLIENT,
+        "saml2": "disabled",
+        "$format": "json"
+    }
+
+    if params:
+        query.update(params)
+
+    try:
+        response = session.get(url, params=query, timeout=30)
+
+        if response.status_code != 200:
+            return {
+                "status": "error",
+                "status_code": response.status_code,
+                "response": response.text[:1000],
+                "url": response.url
+            }
+
+        return response.json()
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def extract_count(data):
+    count = data.get("d", {}).get("__count")
+    if count is not None:
+        return int(count)
+
+    results = data.get("d", {}).get("results", [])
+    return len(results)
+
+
+def count_cost_centers(controlling_area="TT01"):
+    controlling_area = clean_value(controlling_area).upper()
+
+    data = call_sap(COST_CENTER_URL, {
+        "$filter": f"ControllingArea eq '{controlling_area}'",
+        "$inlinecount": "allpages",
+        "$top": "1"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    return {
+        "status": "success",
+        "type": "cost_center_count",
+        "data": {
+            "ControllingArea": controlling_area,
+            "TotalCostCenters": extract_count(data)
+        }
+    }
+
+
+def count_purchase_orders():
+    data = call_sap(PO_URL, {
+        "$inlinecount": "allpages",
+        "$top": "1"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    return {
+        "status": "success",
+        "type": "purchase_order_count",
+        "data": {
+            "TotalPurchaseOrders": extract_count(data)
+        }
+    }
+
+
+def count_sales_orders():
+    data = call_sap(SO_URL, {
+        "$inlinecount": "allpages",
+        "$top": "1"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    return {
+        "status": "success",
+        "type": "sales_order_count",
+        "data": {
+            "TotalSalesOrders": extract_count(data)
+        }
+    }
+
+
+def count_idocs_by_status(status):
+    status = clean_value(status)
+
+    if not status:
+        return {"status": "error", "message": "IDoc status is missing"}
+
+    data = call_sap(IDOC_URL, {
+        "$filter": f"Status eq '{status}'",
+        "$inlinecount": "allpages",
+        "$top": "1"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    return {
+        "status": "success",
+        "type": "idoc_status_count",
+        "data": {
+            "Status": status,
+            "TotalIDocs": extract_count(data)
+        }
+    }
+
+
+def check_failed_idoc(idoc_number):
+    idoc_number = clean_value(idoc_number).zfill(16)
+
+    data = call_sap(IDOC_URL, {
+        "$filter": f"Docnum eq '{idoc_number}'"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    results = data.get("d", {}).get("results", [])
+
+    if not results:
+        return {"status": "not_found", "message": f"IDoc {idoc_number} not found"}
+
+    item = results[0]
+
+    return {
+        "status": "success",
+        "type": "idoc",
+        "data": {
+            "IDoc": item.get("Docnum"),
+            "Status": item.get("Status"),
+            "MessageType": item.get("MessageType"),
+            "CreatedDate": item.get("CreatedDate"),
+            "ErrorText": item.get("ErrorText")
+        }
+    }
+
+
+def check_cost_center(cost_center, controlling_area="TT01"):
+    cost_center = clean_value(cost_center).upper()
+    controlling_area = clean_value(controlling_area).upper()
+
+    if not cost_center:
+        return {"status": "error", "message": "Cost center ID is missing"}
+
+    data = call_sap(COST_CENTER_URL, {
+        "$filter": f"CostCenter eq '{cost_center}' and ControllingArea eq '{controlling_area}'"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    results = data.get("d", {}).get("results", [])
+
+    if not results:
+        return {"status": "not_found", "message": f"Cost center {cost_center} not found"}
+
+    item = results[0]
+
+    return {
+        "status": "success",
+        "type": "cost_center",
+        "data": {
+            "CostCenter": item.get("CostCenter"),
+            "ControllingArea": item.get("ControllingArea"),
+            "Name": item.get("CostCenterName"),
+            "Description": item.get("CostCenterDescription"),
+            "EndDate": item.get("ValidityEndDate")
+        }
+    }
+
+
+def check_sales_order(sales_order):
+    sales_order = clean_value(sales_order)
+
+    if not sales_order:
+        return {"status": "error", "message": "Sales order number is missing"}
+
+    data = call_sap(SO_URL, {
+        "$filter": f"SalesOrder eq '{sales_order}'",
+        "$select": "SalesOrder,SoldToParty,TotalNetAmount,TransactionCurrency,PurchaseOrderByCustomer,CreationDate"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    results = data.get("d", {}).get("results", [])
+
+    if not results:
+        return {"status": "not_found", "message": f"Sales order {sales_order} not found"}
+
+    item = results[0]
+
+    return {
+        "status": "success",
+        "type": "sales_order",
+        "data": {
+            "SalesOrder": item.get("SalesOrder"),
+            "SoldToParty": item.get("SoldToParty"),
+            "NetAmount": item.get("TotalNetAmount"),
+            "Currency": item.get("TransactionCurrency"),
+            "CustomerReference": item.get("PurchaseOrderByCustomer"),
+            "CreationDate": item.get("CreationDate")
+        }
+    }
+
+
+def check_purchase_order(po_number):
+    po_number = clean_value(po_number)
+
+    if not po_number:
+        return {"status": "error", "message": "Purchase order number is missing"}
+
+    data = call_sap(PO_URL, {
+        "$filter": f"PurchaseOrder eq '{po_number}'"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    results = data.get("d", {}).get("results", [])
+
+    if not results:
+        return {"status": "not_found", "message": f"Purchase order {po_number} not found"}
+
+    item = results[0]
+
+    return {
+        "status": "success",
+        "type": "purchase_order",
+        "data": {
+            "PurchaseOrder": item.get("PurchaseOrder"),
+            "CompanyCode": item.get("CompanyCode"),
+            "Type": item.get("PurchaseOrderType"),
+            "Supplier": item.get("Supplier"),
+            "PurchasingOrg": item.get("PurchasingOrganization"),
+            "Currency": item.get("DocumentCurrency"),
+            "CreationDate": item.get("CreationDate")
+        }
+    }
+
+
+def check_business_partner(bp_number):
+    bp_number = clean_value(bp_number)
+
+    if not bp_number:
+        return {"status": "error", "message": "Business partner number is missing"}
+
+    data = call_sap(BP_URL, {
+        "$filter": f"BusinessPartner eq '{bp_number}'"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    results = data.get("d", {}).get("results", [])
+
+    if not results:
+        return {"status": "not_found", "message": f"Business partner {bp_number} not found"}
+
+    item = results[0]
+
+    return {
+        "status": "success",
+        "type": "business_partner",
+        "data": {
+            "BusinessPartner": item.get("BusinessPartner"),
+            "Name": item.get("BusinessPartnerFullName"),
+            "Customer": item.get("Customer"),
+            "Supplier": item.get("Supplier")
+        }
+    }
+def check_outbound_delivery(delivery_number):
+    delivery_number = clean_value(delivery_number)
+
+    if not delivery_number:
+        return {"status": "error", "message": "Outbound delivery number is missing"}
+
+    data = call_sap(OUTBOUND_DELIVERY_URL, {
+        "$filter": f"DeliveryDocument eq '{delivery_number}'"
+    })
+
+    if data.get("status") == "error":
+        return data
+
+    results = data.get("d", {}).get("results", [])
+
+    if not results:
+        return {
+            "status": "not_found",
+            "message": f"Outbound delivery {delivery_number} not found"
+        }
+
+    item = results[0]
+
+    return {
+        "status": "success",
+        "type": "outbound_delivery",
+        "data": {
+            "DeliveryDocument": item.get("DeliveryDocument"),
+            "ShippingPoint": item.get("ShippingPoint"),
+            "SoldToParty": item.get("SoldToParty"),
+            "ShipToParty": item.get("ShipToParty"),
+            "DeliveryDocumentType": item.get("DeliveryDocumentType"),
+            "OverallGoodsMovementStatus": item.get("OverallGoodsMovementStatus"),
+            "OverallPickingStatus": item.get("OverallPickingStatus"),
+            "CreationDate": item.get("CreationDate")
+        }
+    }
+
+
+def ai_router(question):
+    prompt = """
+You are a secure SAP assistant router.
+Return ONLY valid JSON. No markdown. No explanation.
+
+Actions:
+- check_failed_idoc
+- count_idocs_by_status
+- check_cost_center
+- count_cost_centers
+- check_sales_order
+- count_sales_orders
+- check_purchase_order
+- count_purchase_orders
+- check_business_partner
+- check_outbound_delivery
+- unknown
+
+JSON format:
+{
+  "action": "",
+  "value": "",
+  "controlling_area": "TT01"
+}
+
+Rules:
+- If user asks how many IDocs are in status 51, 56, 68, etc., use count_idocs_by_status and put status in value.
+- If user asks for one specific IDoc number, use check_failed_idoc.
+- If user asks how many cost centers or total cost centers, use count_cost_centers.
+- If user asks for one specific cost center, use check_cost_center.
+- If user asks how many sales orders or total sales orders, use count_sales_orders.
+- If user asks for one specific sales order, use check_sales_order.
+- If user asks how many purchase orders or total purchase orders or POs, use count_purchase_orders.
+- If user asks for one specific purchase order or PO, use check_purchase_order.
+- If user asks for one specific business partner or BP, use check_business_partner.
+- If user asks about outbound delivery, delivery, delivery status, or tracking delivery, use check_outbound_delivery.
+- If controlling area is missing, use TT01.
+- For count actions except IDoc status count, value can be empty.
+- Never ask for passwords, tokens, cookies, or credentials.
+"""
+
+    response = azure_client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": question.strip()}
+        ],
+        temperature=0,
+        max_tokens=150
+    )
+
+    try:
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception:
+        return {"action": "unknown", "value": "", "controlling_area": "TT01"}
+
+
+def ai_format_answer(question, sap_result):
+    response = azure_client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an SAP assistant. Answer in simple English. "
+                    "Use only the SAP result provided. "
+                    "Do not expose credentials, URLs, tokens, or secrets. "
+                    "If count is available, clearly state the count."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nSAP result:\n{json.dumps(sap_result, indent=2)}"
+            }
+        ],
+        temperature=0,
+        max_tokens=400
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+def run_agent(question):
+    question = question.strip()
+    route = ai_router(question)
+
+    action = clean_value(route.get("action", "unknown"))
+    value = clean_value(route.get("value", ""))
+    controlling_area = clean_value(route.get("controlling_area", "TT01")).upper()
+
+    if action == "check_failed_idoc":
+        result = check_failed_idoc(value)
+    elif action == "count_idocs_by_status":
+        result = count_idocs_by_status(value)
+    elif action == "check_cost_center":
+        result = check_cost_center(value, controlling_area)
+    elif action == "count_cost_centers":
+        result = count_cost_centers(controlling_area)
+    elif action == "check_sales_order":
+        result = check_sales_order(value)
+    elif action == "count_sales_orders":
+        result = count_sales_orders()
+    elif action == "check_purchase_order":
+        result = check_purchase_order(value)
+    elif action == "count_purchase_orders":
+        result = count_purchase_orders()
+    elif action == "check_business_partner":
+        result = check_business_partner(value)
+    elif action == "check_outbound_delivery":
+        result = check_outbound_delivery(value)
+    else:
+        return "I can check IDoc, Cost Center, Sales Order, Purchase Order, or Business Partner."
+
+    return ai_format_answer(question, result)
+
+
+if __name__ == "__main__":
+    print("SAP AI Assistant started")
+    print("Type exit to stop\n")
+
+    while True:
+        question = input("You: ").strip()
+
+        if question.lower() in ["exit", "quit", "bye"]:
+            print("Assistant: Bye")
+            break
+
+        print("\nAssistant:")
+        print(run_agent(question))
+        print()

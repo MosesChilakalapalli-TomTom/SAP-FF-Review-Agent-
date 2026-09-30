@@ -1,0 +1,31 @@
+https://s4-dev.sap.tomtomgroup.com/sap/opu/odata/sap/ZFF_REVIEW_SRV/PendingReviewSet?$format=json&saml2=disabled&sap-client=300 
+
+https://s4-dev.sap.tomtomgroup.com/sap/opu/odata/sap/ZFF_REVIEW_SRV/SessionActivitySet?$format=json&saml2=disabled&sap-client=300
+
+## Chat authorization
+
+`POST /api/chat` accepts only `question` and `session_id` in the JSON body.
+The caller must be authenticated by App Service Authentication (Easy Auth);
+the backend reads the trusted `X-MS-CLIENT-PRINCIPAL` header and ignores
+identity or controller fields in the body.
+
+SAP is the source of truth for the Entra identity-to-controller relationship.
+The default controller master is:
+
+`ZFF_REVIEW_SRV/ControllerMasterSet`
+
+The lookup selects `Email` and `Controller`, filters by the normalized
+authenticated corporate email, and limits the response to two rows. These can
+be overridden with `SAP_CONTROLLER_MASTER_URL`,
+`SAP_CONTROLLER_MASTER_EMAIL_FIELD`, and
+`SAP_CONTROLLER_MASTER_ID_FIELD` when the SAP service metadata differs.
+
+An unauthenticated or malformed Easy Auth identity receives `401`.
+An authenticated user with no SAP controller, or conflicting controller
+records, receives `403`. SAP lookup or response failures receive `502`.
+`ENTRA_CONTROLLER_MAP` is not used. Authenticated but unregistered users
+must be registered in SAP before they can access Firefighter data.
+
+For local console-only development, `LOCAL_DEV_CONTROLLER` may be set when
+running the agent module directly. It is read only inside the module's
+`if __name__ == "__main__":` block and cannot affect Azure HTTP requests.

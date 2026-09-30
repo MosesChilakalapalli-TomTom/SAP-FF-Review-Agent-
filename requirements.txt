@@ -1,0 +1,8 @@
+azure-functions
+azure-search-documents
+azure-data-tables
+openai
+requests
+python-jose[cryptography]
+cryptography
+python-dotenv
